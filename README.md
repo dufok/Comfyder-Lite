@@ -1,99 +1,105 @@
-# Comfyder Lite
+# Comfyder
 
-**AI-refine your Blender renders with one button — right inside Blender.**
+**AI rendering for Blender via ComfyUI + fal.ai — from one-button refine to a full zone-based pipeline.**
 
 > ⚠️ **Requires: a running [ComfyUI](https://github.com/comfyanonymous/ComfyUI) server + a [fal.ai](https://fal.ai) API key.**
 > ComfyUI is only the orchestrator (CPU-only is fine) — all generation runs on FAL as paid API calls (typically a few cents per image).
 
-Render → type a mood prompt → get a polished AI render back as a new image in Blender.
-No node wrangling, no exports, UI never freezes.
+Two add-ons in this repo:
 
-![Comfyder Lite demo](docs/img/demo_lite.jpg)
-*Raw viewport-color render → prompt: "hyperreal 4K render, soft cinematic light beams, atmospheric smoke" → one click.*
-
----
-
-## How it works
-
-```
-Blender render ──► ComfyUI (your server) ──► fal.ai
-     │                    │
-     │              [VLM_fal]  Gemini vision describes the scene
-     │                    │    and merges it with your mood prompt
-     │                    ▼
-     └─(depth map)─► [FalGeminiFlashEdit]  Gemini 3.1 edits the frame,
-                          │                depth map as geometry reference
-                          ▼
-                   result appears in Blender as "Comfyder Result"
-```
-
-The add-on talks to ComfyUI over plain HTTP (`/upload/image`, `/prompt`, `/history`)
-and polls in the background via `bpy.app.timers` — Blender stays responsive.
+| Add-on | What it does |
+|---|---|
+| **Comfyder Lite** | One button: render → mood prompt → refined AI render back in Blender |
+| **Comfyder Pro** | The full pipeline: per-material zones with masks, engines and sliders — blocking in, art-directed board out |
 
 ## Requirements
 
 | What | Why |
 |---|---|
-| **ComfyUI** reachable over HTTP (localhost or LAN) | Orchestrator. Never samples locally — CPU box is fine |
-| **[gokayfem/ComfyUI-fal-API](https://github.com/gokayfem/ComfyUI-fal-API)** custom nodes | `VLM_fal` (scene description) |
-| **ComfyUI-FAL** (Image Edit pack) custom nodes | `FalGeminiFlashEdit` (the actual image edit) |
+| **ComfyUI** reachable over HTTP (localhost or LAN) | Orchestrator. Never samples locally — a CPU box is fine |
+| **[gokayfem/ComfyUI-fal-API](https://github.com/gokayfem/ComfyUI-fal-API)** custom nodes | `FluxGeneral_fal`, `FluxPro1Fill_fal`, `FluxProKontext_fal`, `VLM_fal`, … |
+| **ComfyUI-FAL** (Image Edit pack) custom nodes | `FalGeminiFlashEdit`, `FalQwenImageEditInpaint`, `FalZImageTurboInpaint`, … |
 | **`FAL_KEY`** env var in the ComfyUI process | All generation is billed per call on [fal.ai](https://fal.ai) |
-| **Blender 5.0+** | Add-on uses the 5.x compositor API for auto-depth |
+| **Blender 5.0+** | Both add-ons use the 5.x compositor API |
 
 ## Install
 
-1. Set up the ComfyUI side (node packs + `FAL_KEY`), note the server address.
-2. In Blender: `Edit → Preferences → Add-ons → Install from Disk…` → select `addon/comfyder_lite.py` → enable.
-3. In the panel, set your ComfyUI address (default `http://192.168.1.2:8188`).
+Grab a zip from [`dist/`](dist/) and either:
 
-## Usage
+- **drag & drop** the zip into the Blender window → Install → enable, or
+- `Edit → Preferences → Get Extensions → ⌄ (top-right) → Install from Disk…` → pick the zip.
 
-1. Press **F12** to render (or choose *Viewport* as source — an OpenGL snapshot of what you see).
-2. In the render window press **N** → **Comfyder** tab.
-3. Type a mood/style prompt — any language works, e.g.
-   `4K hi-res render, добавить лучи света и атмосферный дым`.
-4. **Generate**. Status is shown in the panel; ~30–90 s later the result
-   loads as a new image **"Comfyder Result"** (switch images in the header).
+Classic single-file install also works: `Preferences → Add-ons → Install from Disk…` → `addon/comfyder_*.py`.
 
-### Panel reference
+Then set your ComfyUI address in the panel.
 
-| Setting | Default | What it does |
+---
+
+## Comfyder Lite
+
+Refine any render (or a viewport snapshot) with a single prompt.
+
+**Use:** press **F12** → in the render window press **N** → **Comfyder** tab → type a mood prompt (any language) → **Generate**. ~30–90 s later the result loads as a new image *"Comfyder Result"*.
+
+**Chain:** frame → `VLM_fal` (Gemini vision describes the scene, merges your mood prompt) → `FalGeminiFlashEdit` (edits the frame; optional depth map as a geometry reference) → back to Blender. Background polling — the UI never freezes.
+
+| Setting | Default | Notes |
 |---|---|---|
-| Prompt (✏ opens a wide editor) | — | Mood/style instruction merged into the generation |
-| VLM-описание сцены | on | Gemini vision first describes your frame, then applies your mood on top — better scene fidelity |
-| Источник: Рендер / Вьюпорт | Рендер | What to send: last F12 render or an OpenGL viewport snapshot |
+| Prompt (✏ wide editor) | — | Mood/style instruction |
+| VLM scene description | on | Better scene fidelity |
+| Source: Render / Viewport | Render | Viewport = OpenGL snapshot, quick drafts without F12 |
 | 1K / 2K / 4K | 2K | Output resolution |
-| Seed | 7 | Fix it to iterate comparably |
-| Прикладывать depth | off | Send a depth map as a second input — locks geometry much harder |
-| Авто-рендер depth | on | Add-on renders a fresh Z-pass depth map itself (temporary compositor, your setup is restored). Note: replaces the Render Result preview; not available for *Viewport* source |
-| Depth PNG | — | Manual depth file (used when auto is off) |
-| ComfyUI | `http://…:8188` | Server address |
+| Attach depth + Auto-render depth | off / on | Depth locks geometry hard; auto mode renders a fresh Z-pass map itself (your compositor is restored) |
+| Seed | 7 | FAL backends are not fully deterministic — keep results you like |
 
-### Tips
+---
 
-- **Depth on** = geometry survives aggressive restyling. Best combo: *Рендер* + auto-depth.
-- The VLM describes **what it sees** — if your render is grey clay, say what things should become in the prompt.
-- Same seed + same inputs ≠ pixel-identical results (FAL backends are not deterministic). Keep good results — regenerating "the same" costs another call.
-- *Viewport* source sends everything visible in the viewport, gizmos included — fly to camera view (`Numpad 0`) first.
+## Comfyder Pro
 
-## Advanced: full zone-based pipeline (Blocking2Render)
+The zone pipeline: assign placeholder `mat_*` materials to objects, describe each zone, press Generate. Every zone gets its own AI pass through its own Cryptomatte mask.
 
-This repo also ships the full pipeline the add-on grew out of: rough blocking
-with placeholder materials → depth ControlNet global pass → **per-material
-AI passes via Cryptomatte masks** (brick / water / flowers each with its own
-prompt, engine and mask softness) → final refine.
+**Chain:** pass pack (depth + per-zone masks, rendered by the add-on) → global pass (Flux + depth ControlNet — *this pass sets the colors of the whole image*) → sequential zone passes → final refine (Gemini: frame + depth + mood + auto-protect list). Every intermediate step is saved to the results folder.
 
-![pipeline demo](docs/img/demo_pipeline.jpg)
+**The three-prompt pyramid:**
 
-- `blender/setup_passes.py` — renders `depth.png` + one mask per `mat_*` material (dilate/blur baked in)
-- `driver/comfy_graph_v2.py` — graph builder; per-zone engines: `fill`, `qwen` (strength+negative), `gemini_zone`, `kontext_zone`, reference swatches, procedural light `overlay`
-- `driver/run.py` + `driver/materials.yaml` — config-driven runner
-- [docs/Blocking2Render.md](docs/Blocking2Render.md) — field notes: 20 battle-tested rules (mask sizes, engine choice per zone type, aspect-ratio traps, pinning against non-determinism)
+1. **Zone prompts** — what each material is (`old red brick wall…`, `ring of clear water…`).
+2. **Scene prompt** — the global pass. Build it from zones with one click, then append environment/atmosphere at the end. Colors are decided HERE.
+3. **Mood** (final pass) — quality/light/haze/DoF. Do not describe materials here: zones marked *Protect in final* are appended automatically as "Keep exactly: …".
+
+**Zone engines** (each zone picks its own):
+
+| Engine | Best for | Notes |
+|---|---|---|
+| Fill — repaint | color flips, thin structures, flowers | pixel-exact to the mask |
+| Qwen — texture | refining texture on large zones | `strength` + negative prompt; resamples the frame — not for thin things |
+| Gemini — wide zone | walls, water, backgrounds | smart 2K edit composited back by mask |
+| Kontext — structure | keep exact shapes | tends to "lacquer" organics |
+| Z-Turbo — draft | cheap quick checks | |
+
+**Per-zone mask sliders:** `Dilate` / `Blur` (defaults 6/4; use 15–25/15+ for flowers and glow so petals are not clipped by the silhouette).
+
+**Workflow tips (battle-tested):**
+
+- List order = pass order: large zones first, small last.
+- A telephoto lens from far away gives a flat depth map — the panel warns you; 24mm closer works much better.
+- Resolution is auto-capped to 1536 px / multiple of 16 (FluxGeneral limit).
+- Fix the seed and iterate a single zone — re-running one zone costs cents.
+- FAL is not deterministic even with a fixed seed: when you like a result, keep it and iterate *from* it rather than re-running the whole chain.
+
+---
+
+## Also in this repo
+
+- `blender/setup_passes.py` — standalone pass-pack renderer (depth + Cryptomatte masks)
+- `driver/comfy_graph_v2.py` + `driver/run.py` + `driver/materials.yaml` — the same pipeline as a scriptable CLI driver
+- `docs/Blocking2Render.md` — field notes the add-ons are built on (20 rules: mask sizes, engine choice, aspect-ratio traps, pinning)
 
 ## Roadmap
 
-- v0.2: result history with **Pin** (iterate from any kept frame), prompt presets
-- Full Comfyder: the zone pipeline driven from the N-panel — materials list with per-zone prompts, engines and mask sliders
+- Light zones: volumetric beams outside the depth map + procedural overlay with an intensity slider
+- Reference swatches per zone (NanoBanana / Kontext Multi)
+- Result history with **Pin** — iterate from any kept frame
+- "Open in ComfyUI" — inspect the exact executed graph
 
 ## License
 
