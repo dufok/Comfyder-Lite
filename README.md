@@ -73,8 +73,13 @@ The zone pipeline: assign placeholder `mat_*` materials to objects, describe eac
 | Fill — repaint | color flips, thin structures, flowers | pixel-exact to the mask |
 | Qwen — texture | refining texture on large zones | `strength` + negative prompt; resamples the frame — not for thin things |
 | Gemini — wide zone | walls, water, backgrounds | smart 2K edit composited back by mask |
+| Gemini — reference swatch | fabrics, stone, client-supplied materials | apply a **photo swatch** to the zone |
 | Kontext — structure | keep exact shapes | tends to "lacquer" organics |
 | Z-Turbo — draft | cheap quick checks | |
+
+**Light beams:** set a zone's kind to *Light beam* — its geometry is excluded from depth/global, and its mask becomes a warm screen overlay applied AFTER the final pass. Zero API cost, and the **Re-light** button re-applies it with the current intensity slider instantly — tune the beam for free.
+
+**History & Pin:** every run lands in its own `run_*` folder with a settings snapshot. Pin any step and iterate from it for cents: *Re-run active zone from Pin* or *Final from Pin* (new mood). FAL is not deterministic — pinning is how you keep a result you like.
 
 **Per-zone mask sliders:** `Dilate` / `Blur` (defaults 6/4; use 15–25/15+ for flowers and glow so petals are not clipped by the silhouette).
 
@@ -96,10 +101,9 @@ The zone pipeline: assign placeholder `mat_*` materials to objects, describe eac
 
 ## Roadmap
 
-- Light zones: volumetric beams outside the depth map + procedural overlay with an intensity slider
-- Reference swatches per zone (NanoBanana / Kontext Multi)
-- Result history with **Pin** — iterate from any kept frame
 - "Open in ComfyUI" — inspect the exact executed graph
+- Prompt presets and per-zone swatch generation from text
+- Gonka prompt translation (write zones in any language, LLM-translated in-graph)
 
 ## License
 

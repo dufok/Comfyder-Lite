@@ -1,14 +1,16 @@
 # Comfyder Pro — zone-based AI render pipeline in the Blender N-panel.
 #
-# Full Blocking2Render cycle with one button, plus result history with Pin:
-#   1) render the pass pack (depth + a Cryptomatte mask per zone) with a
-#      temporary compositor — your own compositor setup is left untouched;
-#   2) ComfyUI graph: global pass (Flux + depth ControlNet) ->
-#      per-zone masked passes -> final refine (Gemini: frame + depth);
-#   3) every run lands in its own run_* folder with a settings snapshot;
-#      Pin any step and iterate from it for cents: re-run a single zone
-#      or just the final mood pass. FAL is not deterministic — pinning is
-#      how you keep a result you like.
+# Full Blocking2Render cycle with one button:
+#   pass pack (depth + Cryptomatte mask per zone) -> global pass (Flux +
+#   depth ControlNet) -> per-zone passes -> final refine (Gemini) ->
+#   procedural light beams (free numpy overlay, re-tweakable).
+# Result history with Pin: iterate any kept frame for cents (FAL is not
+# deterministic — pinning is how you keep a result you like).
+#
+# Zone kinds:
+#   Material — an AI pass through the zone's mask (5 engines + swatch);
+#   Light beam — geometry excluded from depth/global, its mask becomes a
+#   warm screen overlay AFTER the final pass. Zero API cost, live slider.
 #
 # Requirements: ComfyUI + fal node packs + FAL_KEY (see the repo README).
 # Blender 5.0+ (new compositor API).
@@ -16,15 +18,17 @@
 bl_info = {
     "name": "Comfyder Pro",
     "author": "Stepan Vladovskiy",
-    "version": (0, 3, 0),
+    "version": (0, 4, 0),
     "blender": (5, 0, 0),
     "location": "3D View / Image Editor > Sidebar (N) > Comfyder Pro",
-    "description": "Zone-based AI rendering with result history and Pin",
+    "description": "Zone-based AI rendering: masks, swatches, light beams, "
+                   "history with Pin",
     "category": "Render",
 }
 
 import json
 import os
+import shutil
 import tempfile
 import textwrap
 import time
@@ -37,8 +41,9 @@ from mathutils import Vector
 
 MAT_PREFIX = "mat_"
 HIST_CAP = 200
+BEAM_WARM = (1.0, 0.97, 0.88)
 _JOB = {"prompt_id": None, "host": None, "t0": 0.0, "scene": None,
-        "run_dir": None, "final_prefix": "99_final"}
+        "run_dir": None, "final_prefix": "99_final", "beams": None}
 
 
 # =================================================================== HTTP
@@ -202,6 +207,98 @@ def _render_pack(context, zones):
     return {"depth": depth, "masks": masks}
 
 
+# =================================================================== beams
+def _beam_objects(beam_mats):
+    """Objects that use any of the beam materials."""
+    objs = []
+    for ob in bpy.data.objects:
+        if ob.type not in {'MESH', 'CURVE'}:
+            continue
+        for slot in ob.material_slots:
+            if slot.material and slot.material.name in beam_mats:
+                objs.append(ob)
+                break
+    return objs
+
+
+class _HideBeams:
+    """Context manager: hide beam objects from rendering (depth/global)."""
+
+    def __init__(self, beam_mats):
+        self.objs = _beam_objects(beam_mats)
+        self.saved = {}
+
+    def __enter__(self):
+        for ob in self.objs:
+            self.saved[ob.name] = ob.hide_render
+            ob.hide_render = True
+        return self
+
+    def __exit__(self, *a):
+        for name, v in self.saved.items():
+            ob = bpy.data.objects.get(name)
+            if ob:
+                ob.hide_render = v
+
+
+def _prep_beams(context, run_dir, beam_zones):
+    """Render beam masks (beams visible, occlusion honest) and copy them
+    into the run folder. Returns [(mask_path, intensity, name)]."""
+    if not beam_zones:
+        return []
+    # make sure beam objects are renderable for this pass
+    saved = {}
+    for ob in _beam_objects({z["name"] for z in beam_zones}):
+        saved[ob.name] = ob.hide_render
+        ob.hide_render = False
+    try:
+        pack = _render_pack(context, [(z["name"], z["dilate"], z["blur"])
+                                      for z in beam_zones])
+    finally:
+        for name, v in saved.items():
+            ob = bpy.data.objects.get(name)
+            if ob:
+                ob.hide_render = v
+    beams = []
+    for z in beam_zones:
+        dst = os.path.join(run_dir, f"cp_mask_{z['name']}.png")
+        shutil.copy(pack["masks"][z["name"]], dst)
+        beams.append((dst, z["intensity"], z["name"]))
+    return beams
+
+
+def _apply_light(final_path, beams, out_path):
+    """Warm screen overlay of beam masks over the final frame. Free."""
+    import numpy as np
+    img = bpy.data.images.load(final_path, check_existing=False)
+    w, h = img.size
+    px = np.empty(w * h * 4, dtype=np.float32)
+    img.pixels.foreach_get(px)
+    rgb = px.reshape(h, w, 4)
+    warm = np.array(BEAM_WARM, dtype=np.float32)
+    for mask_path, inten, _n in beams:
+        mi = bpy.data.images.load(mask_path, check_existing=False)
+        mw, mh = mi.size
+        mp = np.empty(mw * mh * 4, dtype=np.float32)
+        mi.pixels.foreach_get(mp)
+        m = mp.reshape(mh, mw, 4)[:, :, 0]
+        if (mw, mh) != (w, h):
+            yi = np.linspace(0, mh - 1, h).astype(int)
+            xi = np.linspace(0, mw - 1, w).astype(int)
+            m = m[yi][:, xi]
+        b = (m * float(inten))[..., None] * warm
+        rgb[:, :, :3] = 1.0 - (1.0 - rgb[:, :, :3]) * (1.0 - b)
+        bpy.data.images.remove(mi)
+    out = bpy.data.images.new("_comfyder_light_tmp", width=w, height=h)
+    out.pixels.foreach_set(rgb.reshape(-1))
+    out.filepath_raw = out_path
+    out.file_format = 'PNG'
+    out.save()
+    bpy.data.images.remove(out)
+    bpy.data.images.remove(img)
+    return out_path
+
+
 # =================================================================== graph
 class _G:
     """Tiny ComfyUI API-graph builder."""
@@ -287,6 +384,24 @@ def _zone_pass(g, z, current, mask_name, width, height, seed_default, idx=1):
             num_images=1, seed=seed)
         return _composite_back(g, edited, m, current, zname, width, height,
                                src_w=2752, src_h=1536)
+    if eng == "gemini_ref":
+        tgt = z["target"] or f"the {zname[len(MAT_PREFIX):]} zone"
+        swatch = g.node("LoadImage", _title=f"Swatch {zname}",
+                        image=z["ref_name"])
+        prompt = (z["prompt"] or
+                  "Apply the material shown in the second image.")
+        edited = g.node(
+            "FalGeminiFlashEdit", _title=f"2.{idx}) Gemini ref — {zname}",
+            image=[current, 0], image_2=[swatch, 0], prompt=prompt,
+            version="3.1-flash-preview", resolution="2K",
+            system_prompt=("The second image is a material swatch. Apply "
+                           f"that exact material and finish to ONLY {tgt} "
+                           "in the first image. Keep composition, all other "
+                           "objects, lighting, framing and aspect ratio "
+                           "exactly unchanged."),
+            num_images=1, seed=seed)
+        return _composite_back(g, edited, m, current, zname, width, height,
+                               src_w=2752, src_h=1536)
     if eng == "kontext_zone":
         tgt = z["target"] or "the masked area"
         instr = (f"Change {tgt} to: {z['prompt']}. Keep the composition, "
@@ -302,7 +417,7 @@ def _zone_pass(g, z, current, mask_name, width, height, seed_default, idx=1):
 
 def _final_prompt(mood, zones):
     protect = [z["target"] or z["prompt"].split(",")[0]
-               for z in zones if z.get("protect")]
+               for z in zones if z.get("protect") and z.get("prompt")]
     fp = mood.strip()
     if protect:
         fp += " Keep exactly: " + "; ".join(protect) + "."
@@ -384,22 +499,20 @@ def _hist_add(scene, label, path):
     p.hist_index = len(p.hist) - 1
 
 
-def _run_meta(p, zones, kind):
-    return {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "kind": kind,
-            "scene_prompt": p.scene_prompt, "mood": p.mood,
-            "conditioning": p.conditioning, "seed": p.seed,
-            "final": p.final_enabled, "zones": zones}
-
-
-def _start_run(context, kind, zones_meta):
+def _start_run(context, kind, zones_meta, beams_meta=None):
     """Create the run folder + settings snapshot; return its path."""
     p = context.scene.comfyder_pro
     base = bpy.path.abspath(p.output_dir)
     run_dir = os.path.join(base, time.strftime("run_%Y%m%d_%H%M%S"))
     os.makedirs(run_dir, exist_ok=True)
+    meta = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "kind": kind,
+            "scene_prompt": p.scene_prompt, "mood": p.mood,
+            "conditioning": p.conditioning, "seed": p.seed,
+            "final": p.final_enabled, "zones": zones_meta}
+    if beams_meta:
+        meta["beams"] = beams_meta
     with open(os.path.join(run_dir, "run.json"), "w", encoding="utf-8") as fh:
-        json.dump(_run_meta(p, zones_meta, kind), fh,
-                  ensure_ascii=False, indent=1)
+        json.dump(meta, fh, ensure_ascii=False, indent=1)
     return run_dir
 
 
@@ -413,6 +526,17 @@ def _set_status(txt):
             for a in w.screen.areas:
                 if a.type in ('IMAGE_EDITOR', 'VIEW_3D'):
                     a.tag_redraw()
+
+
+def _show_image(path, name):
+    img = bpy.data.images.load(path, check_existing=False)
+    img.name = name
+    for w in bpy.context.window_manager.windows:
+        for a in w.screen.areas:
+            if a.type == 'IMAGE_EDITOR':
+                a.spaces.active.image = img
+                a.tag_redraw()
+                return
 
 
 def _poll():
@@ -463,15 +587,14 @@ def _poll():
                     final_path = dst
                 if final_path is None:
                     final_path = dst  # at least the latest step
+        beams = _JOB.get("beams")
+        if final_path and beams:
+            lit = os.path.join(run_dir, "99_light.png")
+            _apply_light(final_path, beams, lit)
+            _hist_add(scene, f"{run_tag} · 99_light", lit)
+            final_path = lit
         if final_path:
-            img = bpy.data.images.load(final_path, check_existing=False)
-            img.name = "Comfyder Pro Result"
-            for w in bpy.context.window_manager.windows:
-                for a in w.screen.areas:
-                    if a.type == 'IMAGE_EDITOR':
-                        a.spaces.active.image = img
-                        a.tag_redraw()
-                        break
+            _show_image(final_path, "Comfyder Pro Result")
         _set_status("Done — " + os.path.basename(run_dir))
     except Exception as e:
         _set_status("Failed to fetch results: " + str(e)[:60])
@@ -479,7 +602,7 @@ def _poll():
     return None
 
 
-def _submit(context, graph, run_dir):
+def _submit(context, graph, run_dir, beams=None):
     p = context.scene.comfyder_pro
     host = p.host.rstrip("/")
     resp = _http_json(host + "/prompt",
@@ -488,7 +611,7 @@ def _submit(context, graph, run_dir):
     if resp.get("node_errors"):
         raise RuntimeError(str(resp["node_errors"])[:120])
     _JOB.update(prompt_id=resp["prompt_id"], host=host, t0=time.time(),
-                scene=context.scene.name, run_dir=run_dir)
+                scene=context.scene.name, run_dir=run_dir, beams=beams)
     if not bpy.app.timers.is_registered(_poll):
         bpy.app.timers.register(_poll, first_interval=4.0)
 
@@ -503,17 +626,31 @@ ENGINE_ITEMS = [
      "Texture refinement. NOT for thin structures — it resamples the frame"),
     ("gemini_zone", "Gemini — wide zone",
      "Smart edit composited back by mask, 2K. Walls, water, backgrounds"),
+    ("gemini_ref", "Gemini — reference swatch",
+     "Apply a material from a photo swatch (file below). Best for fabrics, "
+     "stone, client-supplied materials"),
     ("kontext_zone", "Kontext — structure",
      "Holds object shape. Tends to 'lacquer' organic surfaces"),
     ("zturbo", "Z-Turbo — draft", "Fast and cheap, for quick checks"),
 ]
 
+KIND_ITEMS = [
+    ("MAT", "Material", "An AI pass through the zone's mask"),
+    ("BEAM", "Light beam",
+     "Geometry is excluded from depth/global; its mask becomes a warm "
+     "screen overlay AFTER the final pass. Zero API cost, re-tweakable"),
+]
+
 
 class ComfyderZoneSettings(bpy.types.PropertyGroup):
+    kind: bpy.props.EnumProperty(name="Kind", items=KIND_ITEMS, default="MAT")
     prompt: bpy.props.StringProperty(
         name="Prompt", description="Zone material description (English works best)")
     engine: bpy.props.EnumProperty(name="Engine", items=ENGINE_ITEMS,
                                    default="qwen")
+    reference: bpy.props.StringProperty(
+        name="Swatch", subtype='FILE_PATH',
+        description="Photo swatch for the 'Gemini — reference swatch' engine")
     strength: bpy.props.FloatProperty(
         name="Strength", default=0.70, min=0.0, max=1.0,
         description="Qwen/Z-Turbo: how much to repaint. ~0.7 texture, "
@@ -525,10 +662,13 @@ class ComfyderZoneSettings(bpy.types.PropertyGroup):
                                    "(e.g.: the large torus ring)")
     dilate: bpy.props.IntProperty(
         name="Dilate px", default=6, min=0, max=64,
-        description="Mask expansion. Use 15–25 for flowers/glow")
+        description="Mask expansion. 15–25 for flowers/glow, ~14 for beams")
     blur: bpy.props.IntProperty(
         name="Blur px", default=4, min=0, max=64,
-        description="Mask edge softness. Use 15+ for flowers")
+        description="Mask edge softness. 15+ for flowers, ~12 for beams")
+    intensity: bpy.props.FloatProperty(
+        name="Intensity", default=0.40, min=0.0, max=1.0,
+        description="Beam overlay strength (free to re-tweak: Re-light)")
     protect: bpy.props.BoolProperty(
         name="Protect in final", default=True,
         description="Adds 'keep …' for this zone to the final prompt")
@@ -574,7 +714,7 @@ class ComfyderProProps(bpy.types.PropertyGroup):
         name="Results", subtype='DIR_PATH', default="//comfyder_out")
 
 
-# =================================================================== zone ops
+# =================================================================== helpers
 def _used_mats():
     return [m.name for m in bpy.data.materials
             if m.users > 0 and not m.is_grease_pencil
@@ -583,11 +723,33 @@ def _used_mats():
 
 def _zone_dict(mat):
     s = mat.comfyder
-    return {"name": mat.name, "prompt": s.prompt.strip(),
-            "engine": s.engine, "strength": s.strength,
-            "negative": s.negative, "target": s.target,
-            "dilate": s.dilate, "blur": s.blur,
-            "protect": s.protect, "seed": s.seed}
+    return {"name": mat.name, "kind": s.kind, "prompt": s.prompt.strip(),
+            "engine": s.engine, "reference": s.reference,
+            "strength": s.strength, "negative": s.negative,
+            "target": s.target, "dilate": s.dilate, "blur": s.blur,
+            "intensity": s.intensity, "protect": s.protect, "seed": s.seed}
+
+
+def _split_zones(p, need_prompts=True):
+    """Collect zone dicts from the list -> (mat_zones, beam_zones)."""
+    mats, beams = [], []
+    for z in p.zones:
+        mat = bpy.data.materials.get(z.name)
+        if mat is None or mat.users == 0:
+            raise RuntimeError(f"Material {z.name} is not used")
+        d = _zone_dict(mat)
+        if d["kind"] == "BEAM":
+            beams.append(d)
+            continue
+        if need_prompts and d["engine"] != "gemini_ref" and not d["prompt"]:
+            raise RuntimeError(f"Zone {z.name} has an empty prompt")
+        if d["engine"] == "gemini_ref":
+            ref = bpy.path.abspath(d["reference"]) if d["reference"] else ""
+            if not os.path.isfile(ref):
+                raise RuntimeError(f"Zone {z.name}: swatch file not found")
+            d["reference_abs"] = ref
+        mats.append(d)
+    return mats, beams
 
 
 def _fit_resolution(scene):
@@ -599,6 +761,7 @@ def _fit_resolution(scene):
     return w, h
 
 
+# =================================================================== zone ops
 class COMFYDERPRO_OT_zone_sync(bpy.types.Operator):
     bl_idname = "comfyder_pro.zone_sync"
     bl_label = "Sync zones"
@@ -691,7 +854,8 @@ class COMFYDERPRO_OT_build_prompt(bpy.types.Operator):
         parts = []
         for z in p.zones:
             mat = bpy.data.materials.get(z.name)
-            if mat and mat.comfyder.prompt.strip():
+            if (mat and mat.comfyder.kind == "MAT"
+                    and mat.comfyder.prompt.strip()):
                 parts.append(mat.comfyder.prompt.strip())
         p.scene_prompt = ", ".join(parts)
         return {'FINISHED'}
@@ -735,7 +899,8 @@ class COMFYDERPRO_OT_edit_text(bpy.types.Operator):
 class COMFYDERPRO_OT_generate(bpy.types.Operator):
     bl_idname = "comfyder_pro.generate"
     bl_label = "Generate"
-    bl_description = "Full run: pass pack -> global -> zones -> final"
+    bl_description = ("Full run: pack -> global -> zones -> final -> "
+                      "light overlay")
 
     def execute(self, context):
         p = context.scene.comfyder_pro
@@ -749,41 +914,43 @@ class COMFYDERPRO_OT_generate(bpy.types.Operator):
         if not p.scene_prompt.strip():
             self.report({'ERROR'}, "Scene prompt is empty — build it from zones")
             return {'CANCELLED'}
-
-        zones = []
-        for z in p.zones:
-            mat = bpy.data.materials.get(z.name)
-            if mat is None or mat.users == 0:
-                self.report({'ERROR'}, f"Material {z.name} is not used")
-                return {'CANCELLED'}
-            if not mat.comfyder.prompt.strip():
-                self.report({'ERROR'}, f"Zone {z.name} has an empty prompt")
-                return {'CANCELLED'}
-            zones.append(_zone_dict(mat))
+        try:
+            mat_zones, beam_zones = _split_zones(p)
+        except RuntimeError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+        if not mat_zones:
+            self.report({'ERROR'}, "No material zones")
+            return {'CANCELLED'}
 
         w, h = _fit_resolution(scene)
         _set_status("Rendering pass pack…")
         try:
-            pack = _render_pack(context, [(z["name"], z["dilate"], z["blur"])
-                                          for z in zones])
-        except Exception as e:
-            self.report({'ERROR'}, f"Pack: {str(e)[:80]}")
-            _set_status("")
-            return {'CANCELLED'}
-
-        host = p.host.rstrip("/")
-        try:
+            with _HideBeams({z["name"] for z in beam_zones}):
+                pack = _render_pack(
+                    context, [(z["name"], z["dilate"], z["blur"])
+                              for z in mat_zones])
+            host = p.host.rstrip("/")
             depth_name = _upload(host, pack["depth"])
             mask_names = {m: _upload(host, path)
                           for m, path in pack["masks"].items()}
-            graph = _build_graph(p, zones, depth_name, mask_names, w, h)
-            run_dir = _start_run(context, "full", zones)
-            _submit(context, graph, run_dir)
+            for z in mat_zones:
+                if z["engine"] == "gemini_ref":
+                    z["ref_name"] = _upload(host, z["reference_abs"],
+                                            f"cp_ref_{z['name']}.png")
+            graph = _build_graph(p, mat_zones, depth_name, mask_names, w, h)
+            beams_meta = [{"mask": f"cp_mask_{z['name']}.png",
+                           "intensity": z["intensity"], "name": z["name"]}
+                          for z in beam_zones]
+            run_dir = _start_run(context, "full", mat_zones, beams_meta)
+            beams = _prep_beams(context, run_dir, beam_zones)
+            _submit(context, graph, run_dir, beams)
         except Exception as e:
-            self.report({'ERROR'}, f"ComfyUI: {str(e)[:100]}")
+            self.report({'ERROR'}, f"{str(e)[:110]}")
             _set_status("")
             return {'CANCELLED'}
-        _set_status(f"Submitted ({len(zones)} zones), waiting…")
+        _set_status(f"Submitted ({len(mat_zones)} zones"
+                    f"{', ' + str(len(beam_zones)) + ' beams' if beam_zones else ''}), waiting…")
         return {'FINISHED'}
 
 
@@ -804,8 +971,9 @@ class COMFYDERPRO_OT_hist_refresh(bpy.types.Operator):
             for run in runs[-40:]:
                 rd = os.path.join(base, run)
                 for f in sorted(os.listdir(rd)):
-                    if f.lower().endswith(".png"):
-                        step = f.split("_0000")[0]
+                    if (f.lower().endswith(".png")
+                            and not f.startswith("cp_mask_")):
+                        step = f.split("_0000")[0].replace(".png", "")
                         _hist_add(context.scene,
                                   f"{run.replace('run_', '')} · {step}",
                                   os.path.join(rd, f))
@@ -834,6 +1002,54 @@ class COMFYDERPRO_OT_hist_view(bpy.types.Operator):
                     a.tag_redraw()
                     return {'FINISHED'}
         self.report({'INFO'}, "Open an Image Editor to view")
+        return {'FINISHED'}
+
+
+class COMFYDERPRO_OT_relight(bpy.types.Operator):
+    bl_idname = "comfyder_pro.relight"
+    bl_label = "Re-light"
+    bl_description = ("Re-apply the beam overlay to the selected history "
+                      "frame with the CURRENT intensity sliders. Free")
+
+    def execute(self, context):
+        p = context.scene.comfyder_pro
+        if not (0 <= p.hist_index < len(p.hist)):
+            self.report({'ERROR'}, "Select a history item")
+            return {'CANCELLED'}
+        it = p.hist[p.hist_index]
+        run_dir = os.path.dirname(it.path)
+        meta_path = os.path.join(run_dir, "run.json")
+        if not os.path.isfile(meta_path):
+            self.report({'ERROR'}, "No run.json next to this frame")
+            return {'CANCELLED'}
+        with open(meta_path, encoding="utf-8") as fh:
+            meta = json.load(fh)
+        beams_meta = meta.get("beams") or []
+        if not beams_meta:
+            self.report({'ERROR'}, "This run has no beam zones")
+            return {'CANCELLED'}
+        beams = []
+        for b in beams_meta:
+            mp = os.path.join(run_dir, b["mask"])
+            if not os.path.isfile(mp):
+                self.report({'ERROR'}, "Mask missing: " + b["mask"])
+                return {'CANCELLED'}
+            mat = bpy.data.materials.get(b.get("name", ""))
+            inten = (mat.comfyder.intensity if mat
+                     else b.get("intensity", 0.4))
+            beams.append((mp, inten, b.get("name", "")))
+        n = 1
+        while os.path.isfile(os.path.join(run_dir, f"relight_{n:02d}.png")):
+            n += 1
+        out = os.path.join(run_dir, f"relight_{n:02d}.png")
+        try:
+            _apply_light(it.path, beams, out)
+        except Exception as e:
+            self.report({'ERROR'}, str(e)[:100])
+            return {'CANCELLED'}
+        run_tag = os.path.basename(run_dir).replace("run_", "")
+        _hist_add(context.scene, f"{run_tag} · relight_{n:02d}", out)
+        _show_image(out, "Comfyder Pro Result")
         return {'FINISHED'}
 
 
@@ -902,26 +1118,52 @@ class COMFYDERPRO_OT_pin_zone(bpy.types.Operator):
             self.report({'ERROR'}, "Select a zone in the list")
             return {'CANCELLED'}
         mat = bpy.data.materials.get(p.zones[p.zone_index].name)
-        if mat is None or not mat.comfyder.prompt.strip():
-            self.report({'ERROR'}, "Zone material missing or prompt empty")
+        if mat is None:
+            self.report({'ERROR'}, "Zone material missing")
             return {'CANCELLED'}
         z = _zone_dict(mat)
+        if z["kind"] == "BEAM":
+            self.report({'ERROR'}, "Beam zones use Re-light, not a pass")
+            return {'CANCELLED'}
+        if z["engine"] == "gemini_ref":
+            ref = bpy.path.abspath(z["reference"]) if z["reference"] else ""
+            if not os.path.isfile(ref):
+                self.report({'ERROR'}, "Swatch file not found")
+                return {'CANCELLED'}
+            z["reference_abs"] = ref
+        elif not z["prompt"]:
+            self.report({'ERROR'}, "Zone prompt is empty")
+            return {'CANCELLED'}
 
+        try:
+            _, beam_zones = _split_zones(p, need_prompts=False)
+        except RuntimeError:
+            beam_zones = []
         w, h = _fit_resolution(context.scene)
         _set_status("Rendering mask…")
         try:
-            pack = _render_pack(context, [(z["name"], z["dilate"], z["blur"])])
+            with _HideBeams({b["name"] for b in beam_zones}):
+                pack = _render_pack(context,
+                                    [(z["name"], z["dilate"], z["blur"])])
             host = p.host.rstrip("/")
             pin_name = _upload(host, p.pin_path, "cp_pin.png")
             mask_name = _upload(host, pack["masks"][z["name"]])
             depth_name = (_upload(host, pack["depth"])
                           if p.final_enabled else None)
+            if z["engine"] == "gemini_ref":
+                z["ref_name"] = _upload(host, z["reference_abs"],
+                                        f"cp_ref_{z['name']}.png")
             graph = _build_pin_zone_graph(p, z, pin_name, mask_name,
                                           depth_name, w, h)
-            run_dir = _start_run(context, f"pin-zone:{z['name']}", [z])
-            _submit(context, graph, run_dir)
+            beams_meta = [{"mask": f"cp_mask_{b['name']}.png",
+                           "intensity": b["intensity"], "name": b["name"]}
+                          for b in beam_zones]
+            run_dir = _start_run(context, f"pin-zone:{z['name']}", [z],
+                                 beams_meta)
+            beams = _prep_beams(context, run_dir, beam_zones)
+            _submit(context, graph, run_dir, beams)
         except Exception as e:
-            self.report({'ERROR'}, str(e)[:100])
+            self.report({'ERROR'}, str(e)[:110])
             _set_status("")
             return {'CANCELLED'}
         _set_status(f"Zone {z['name']} from pin, waiting…")
@@ -942,25 +1184,29 @@ class COMFYDERPRO_OT_pin_final(bpy.types.Operator):
         if not p.pin_path or not os.path.isfile(p.pin_path):
             self.report({'ERROR'}, "No pin — pin a step first")
             return {'CANCELLED'}
-        zones = []
-        for z in p.zones:
-            mat = bpy.data.materials.get(z.name)
-            if mat and mat.comfyder.prompt.strip():
-                zones.append(_zone_dict(mat))
+        try:
+            mat_zones, beam_zones = _split_zones(p, need_prompts=False)
+        except RuntimeError:
+            mat_zones, beam_zones = [], []
 
         w, h = _fit_resolution(context.scene)
         _set_status("Rendering depth…")
         try:
-            pack = _render_pack(context, [])
+            with _HideBeams({b["name"] for b in beam_zones}):
+                pack = _render_pack(context, [])
             host = p.host.rstrip("/")
             pin_name = _upload(host, p.pin_path, "cp_pin.png")
             depth_name = _upload(host, pack["depth"])
-            graph = _build_pin_final_graph(p, zones, pin_name, depth_name,
-                                           w, h)
-            run_dir = _start_run(context, "pin-final", zones)
-            _submit(context, graph, run_dir)
+            graph = _build_pin_final_graph(p, mat_zones, pin_name,
+                                           depth_name, w, h)
+            beams_meta = [{"mask": f"cp_mask_{b['name']}.png",
+                           "intensity": b["intensity"], "name": b["name"]}
+                          for b in beam_zones]
+            run_dir = _start_run(context, "pin-final", mat_zones, beams_meta)
+            beams = _prep_beams(context, run_dir, beam_zones)
+            _submit(context, graph, run_dir, beams)
         except Exception as e:
-            self.report({'ERROR'}, str(e)[:100])
+            self.report({'ERROR'}, str(e)[:110])
             _set_status("")
             return {'CANCELLED'}
         _set_status("Final from pin, waiting…")
@@ -974,11 +1220,17 @@ class COMFYDERPRO_UL_zones(bpy.types.UIList):
         mat = bpy.data.materials.get(item.name)
         row = layout.row(align=True)
         if mat:
-            row.label(text=item.name, icon='MATERIAL')
-            eng = mat.comfyder.engine
-            short = {"fill": "Fill", "qwen": "Qwen", "gemini_zone": "Gem",
-                     "kontext_zone": "Kntx", "zturbo": "ZT"}.get(eng, "?")
-            row.label(text=short)
+            s = mat.comfyder
+            if s.kind == "BEAM":
+                row.label(text=item.name, icon='LIGHT_SPOT')
+                row.label(text="Beam")
+            else:
+                row.label(text=item.name, icon='MATERIAL')
+                short = {"fill": "Fill", "qwen": "Qwen",
+                         "gemini_zone": "Gem", "gemini_ref": "Ref",
+                         "kontext_zone": "Kntx", "zturbo": "ZT"}.get(
+                             s.engine, "?")
+                row.label(text=short)
         else:
             row.label(text=item.name + " (missing)", icon='ERROR')
 
@@ -1035,26 +1287,38 @@ def _draw(panel, context):
         if mat:
             s = mat.comfyder
             zb = box.box()
-            zb.label(text=mat.name)
             row = zb.row(align=True)
-            row.prop(s, "prompt", text="")
-            op = row.operator("comfyder_pro.edit_text", text="",
-                              icon='GREASEPENCIL')
-            op.which = "zone"
-            _wrap_preview(zb, s.prompt)
-            zb.prop(s, "engine", text="")
-            if s.engine in ("qwen", "zturbo"):
-                zb.prop(s, "strength", slider=True)
-            if s.engine == "qwen":
-                zb.prop(s, "negative", text="Negative")
-            if s.engine in ("gemini_zone", "kontext_zone"):
-                zb.prop(s, "target", text="Target")
-            row = zb.row(align=True)
-            row.prop(s, "dilate")
-            row.prop(s, "blur")
-            row = zb.row(align=True)
-            row.prop(s, "protect")
-            row.prop(s, "seed", text="Seed")
+            row.label(text=mat.name)
+            row.prop(s, "kind", text="")
+            if s.kind == "BEAM":
+                zb.prop(s, "intensity", slider=True)
+                row = zb.row(align=True)
+                row.prop(s, "dilate")
+                row.prop(s, "blur")
+                zb.label(text="Beam = free overlay after the final pass",
+                         icon='INFO')
+            else:
+                row = zb.row(align=True)
+                row.prop(s, "prompt", text="")
+                op = row.operator("comfyder_pro.edit_text", text="",
+                                  icon='GREASEPENCIL')
+                op.which = "zone"
+                _wrap_preview(zb, s.prompt)
+                zb.prop(s, "engine", text="")
+                if s.engine == "gemini_ref":
+                    zb.prop(s, "reference", text="")
+                if s.engine in ("qwen", "zturbo"):
+                    zb.prop(s, "strength", slider=True)
+                if s.engine == "qwen":
+                    zb.prop(s, "negative", text="Negative")
+                if s.engine in ("gemini_zone", "gemini_ref", "kontext_zone"):
+                    zb.prop(s, "target", text="Target")
+                row = zb.row(align=True)
+                row.prop(s, "dilate")
+                row.prop(s, "blur")
+                row = zb.row(align=True)
+                row.prop(s, "protect")
+                row.prop(s, "seed", text="Seed")
 
     box = lay.box()
     box.prop(p, "final_enabled", icon='SHADERFX')
@@ -1079,7 +1343,9 @@ def _draw(panel, context):
     row.operator("comfyder_pro.hist_view", icon='HIDE_OFF')
     row.operator("comfyder_pro.pin_set", icon='PINNED')
     row.operator("comfyder_pro.hist_refresh", text="", icon='FILE_REFRESH')
-    box.operator("comfyder_pro.pin_active", icon='IMAGE_DATA')
+    row = box.row(align=True)
+    row.operator("comfyder_pro.pin_active", icon='IMAGE_DATA')
+    row.operator("comfyder_pro.relight", icon='LIGHT')
 
     if p.pin_path:
         pb = lay.box()
@@ -1122,6 +1388,7 @@ classes = (ComfyderZoneSettings, ComfyderZoneRef, ComfyderHistItem,
            COMFYDERPRO_OT_build_prompt, COMFYDERPRO_OT_edit_text,
            COMFYDERPRO_OT_generate,
            COMFYDERPRO_OT_hist_refresh, COMFYDERPRO_OT_hist_view,
+           COMFYDERPRO_OT_relight,
            COMFYDERPRO_OT_pin_set, COMFYDERPRO_OT_pin_active,
            COMFYDERPRO_OT_pin_clear, COMFYDERPRO_OT_pin_zone,
            COMFYDERPRO_OT_pin_final,
